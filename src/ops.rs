@@ -5,11 +5,21 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::fmt::Write;
 
-pub const HELP: &str = "\nCommands\n  balance                                     Refresh and show account balance\n  positions                                   List open positions\n  orders                                       List working orders\n  search <term>                                Find instruments; shows Code column\n  open <buy|sell> <epic|name> <size> [level]   Open now (level = fill price cap)\n  order <buy|sell> <epic|name> <size> <level>  Resting entry; limit/stop vs market\n  cancel <dealId>                              Cancel a working order\n  modify <dealId> stop=<n|off> limit=<n|off>   Set or remove stop/limit\n  close <dealId> [size] [level]                Close now; with level = resting exit\n  pin <code> <epic|off>                        Pin/unpin a short name\n
-  transactions [days]                          Ledger; default last 24h, N days to go back\n  help                                         Show this help\n  clear                                        Clear this output\n  quit                                         Log out and exit\n\nShort names: search shows the Code column; trading an epic pins its code\nautomatically (or pin explicitly). Codes persist across restarts.\n\nExamples\n  search VOD*\n  order buy VOD 1 117\n  pin VOD KA.D.VOD.DAILY.IP\n  open buy UC.D.VOD.DAILY.IP 2\n  close DIAAAAYRNGEVNAJ";
+pub const HELP: &str = "\nCommands\n  balance                                     Refresh and show account balance\n  positions                                   List open positions\n  orders                                       List working orders\n  search <term>                                Find instruments; shows Code column\n  open <buy|sell> <epic|name> <size> [level] [stop=<n>] [limit=<n>]\n                                               Open now (level = fill cap); stop/limit attach SL/TP\n  order <buy|sell> <epic|name> <size> <level> [limit|stop] [stop=<n>] [limit=<n>]\n                                               Resting entry; limit/stop vs market; attach SL/TP\n  cancel <dealId>                              Cancel a working order\n  modify <dealId> stop=<n|off> limit=<n|off>   Set or remove stop/limit on an open position\n  close <dealId> [size] [level]                Close now; with level = resting exit\n  pin <code> <epic|off>                        Pin/unpin a short name\n
+  transactions [days]                          Ledger; default last 24h, N days to go back\n  help                                         Show this help\n  clear                                        Clear this output\n  quit                                         Log out and exit\n\nShort names: search shows the Code column; trading an epic pins its code\nautomatically (or pin explicitly). Codes persist across restarts.\n\nExamples\n  search VOD*\n  order buy VOD 1 117\n  order buy VOD 1 117 limit stop=110 limit=125\n  open buy UC.D.VOD.DAILY.IP 2 stop=110 limit=125\n  pin VOD KA.D.VOD.DAILY.IP\n  close DIAAAAYRNGEVNAJ";
 
 const SIMPLE: [&str; 11] = [
-    "balance", "positions", "orders", "order", "cancel", "pin", "transactions", "help", "clear", "quit", "exit",
+    "balance",
+    "positions",
+    "orders",
+    "order",
+    "cancel",
+    "pin",
+    "transactions",
+    "help",
+    "clear",
+    "quit",
+    "exit",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +38,8 @@ pub enum Cmd {
         epic: String,
         size: f64,
         level: Option<f64>,
+        stop: Option<f64>,
+        limit: Option<f64>,
     },
     Modify {
         deal_id: String,
@@ -45,6 +57,8 @@ pub enum Cmd {
         size: f64,
         level: f64,
         order_type: Option<String>,
+        stop: Option<f64>,
+        limit: Option<f64>,
     },
     Cancel {
         deal_id: String,
@@ -91,7 +105,10 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
             "search" => {
                 i += 1;
                 let mut parts: Vec<&str> = Vec::new();
-                while i < words.len() && !SIMPLE.contains(&words[i]) && !matches!(words[i], "search" | "open" | "modify" | "close") {
+                while i < words.len()
+                    && !SIMPLE.contains(&words[i])
+                    && !matches!(words[i], "search" | "open" | "modify" | "close")
+                {
                     parts.push(words[i]);
                     i += 1;
                 }
@@ -102,13 +119,16 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                 cmds.push(Cmd::Search { term });
             }
             "open" => {
-                let usage = "usage: open <buy|sell> <epic> <size> [level]";
+                let usage = "usage: open <buy|sell> <epic> <size> [level] [stop=<n>] [limit=<n>]";
                 if i + 3 >= words.len() {
                     return Err(usage.into());
                 }
                 let direction = words[i + 1].to_ascii_uppercase();
                 if direction != "BUY" && direction != "SELL" {
-                    return Err(format!("direction must be buy or sell, got `{}`", words[i + 1]));
+                    return Err(format!(
+                        "direction must be buy or sell, got `{}`",
+                        words[i + 1]
+                    ));
                 }
                 let epic = words[i + 2].replace('"', "");
                 let size: f64 = words[i + 3]
@@ -119,10 +139,32 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                 }
                 i += 4;
                 let mut level = None;
-                if i < words.len() {
-                    if let Ok(v) = words[i].parse::<f64>() {
-                        level = Some(v);
+                let mut stop = None;
+                let mut limit = None;
+                while i < words.len() {
+                    if let Some((key, value)) = words[i].split_once('=') {
+                        let v: f64 = value
+                            .parse()
+                            .map_err(|_| format!("invalid level `{value}` in `{}`", words[i]))?;
+                        match key {
+                            "stop" => stop = Some(v),
+                            "limit" => limit = Some(v),
+                            other => {
+                                return Err(format!(
+                                    "unknown option `{other}` - use stop= or limit="
+                                ))
+                            }
+                        }
                         i += 1;
+                    } else if level.is_none() {
+                        if let Ok(v) = words[i].parse::<f64>() {
+                            level = Some(v);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
                     }
                 }
                 cmds.push(Cmd::Open {
@@ -130,6 +172,8 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                     epic,
                     size,
                     level,
+                    stop,
+                    limit,
                 });
             }
             "modify" => {
@@ -145,8 +189,7 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                     let Some((key, value)) = words[i].split_once('=') else {
                         break;
                     };
-                    let parsed = parse_level(value)
-                        .map_err(|e| format!("{}: {e}", words[i]))?;
+                    let parsed = parse_level(value).map_err(|e| format!("{}: {e}", words[i]))?;
                     match key {
                         "stop" => stop = Some(parsed),
                         "limit" => limit = Some(parsed),
@@ -189,13 +232,16 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                 });
             }
             "order" => {
-                let usage = "usage: order <buy|sell> <epic> <size> <level> [limit|stop]";
+                let usage = "usage: order <buy|sell> <epic> <size> <level> [limit|stop] [stop=<n>] [limit=<n>]";
                 if i + 4 >= words.len() {
                     return Err(usage.into());
                 }
                 let direction = words[i + 1].to_ascii_uppercase();
                 if direction != "BUY" && direction != "SELL" {
-                    return Err(format!("direction must be buy or sell, got `{}`", words[i + 1]));
+                    return Err(format!(
+                        "direction must be buy or sell, got `{}`",
+                        words[i + 1]
+                    ));
                 }
                 let epic = words[i + 2].replace('"', "");
                 let size: f64 = words[i + 3]
@@ -209,17 +255,35 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                     .map_err(|_| format!("invalid level `{}`", words[i + 4]))?;
                 i += 5;
                 let mut order_type = None;
-                if i < words.len() {
-                    match words[i].to_ascii_lowercase().as_str() {
-                        "limit" => {
-                            order_type = Some("LIMIT".into());
-                            i += 1;
+                let mut stop = None;
+                let mut limit = None;
+                while i < words.len() {
+                    if let Some((key, value)) = words[i].split_once('=') {
+                        let v: f64 = value
+                            .parse()
+                            .map_err(|_| format!("invalid level `{value}` in `{}`", words[i]))?;
+                        match key {
+                            "stop" => stop = Some(v),
+                            "limit" => limit = Some(v),
+                            other => {
+                                return Err(format!(
+                                    "unknown option `{other}` - use stop= or limit="
+                                ))
+                            }
                         }
-                        "stop" => {
-                            order_type = Some("STOP".into());
-                            i += 1;
+                        i += 1;
+                    } else {
+                        match words[i].to_ascii_lowercase().as_str() {
+                            "limit" if order_type.is_none() => {
+                                order_type = Some("LIMIT".into());
+                                i += 1;
+                            }
+                            "stop" if order_type.is_none() => {
+                                order_type = Some("STOP".into());
+                                i += 1;
+                            }
+                            _ => break,
                         }
-                        _ => {}
                     }
                 }
                 cmds.push(Cmd::Order {
@@ -228,6 +292,8 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                     size,
                     level,
                     order_type,
+                    stop,
+                    limit,
                 });
             }
             "cancel" => {
@@ -331,10 +397,7 @@ pub async fn exec(
                     let code = details
                         .iter()
                         .find(|d| {
-                            d.instrument
-                                .as_ref()
-                                .and_then(|i| i.epic.as_deref())
-                                == market.epic()
+                            d.instrument.as_ref().and_then(|i| i.epic.as_deref()) == market.epic()
                         })
                         .and_then(|d| d.instrument.as_ref())
                         .and_then(|i| i.chart_code.clone());
@@ -348,6 +411,8 @@ pub async fn exec(
             epic,
             size,
             level,
+            stop,
+            limit,
         } => {
             let epic = cache.resolve(&epic)?;
             let details = api
@@ -387,6 +452,12 @@ pub async fn exec(
             if let Some(level) = level {
                 body["level"] = json!(level);
             }
+            if let Some(stop) = stop {
+                body["stopLevel"] = json!(stop);
+            }
+            if let Some(limit) = limit {
+                body["limitLevel"] = json!(limit);
+            }
 
             let deal_ref = api
                 .create_position(body)
@@ -394,6 +465,16 @@ pub async fn exec(
                 .context("open request rejected")?;
             let confirm = api.confirm(&deal_ref).await?;
             let mut out = output::deal_block("Position opened", &confirm, session, Some(&name));
+            if stop.is_some() || limit.is_some() {
+                let mut parts = Vec::new();
+                if let Some(stop) = stop {
+                    parts.push(format!("stop {stop}"));
+                }
+                if let Some(limit) = limit {
+                    parts.push(format!("limit {limit}"));
+                }
+                let _ = writeln!(out, "  Attached: {}", parts.join(", "));
+            }
             if let Some(rules) = details.dealing_rules.as_ref() {
                 out.push_str(&output::dealing_rules_line(rules));
             }
@@ -431,7 +512,12 @@ pub async fn exec(
                 .await
                 .with_context(|| format!("modify of {deal_id} failed"))?;
             let confirm = api.confirm(&deal_ref).await?;
-            Ok(output::deal_block("Position updated", &confirm, session, None))
+            Ok(output::deal_block(
+                "Position updated",
+                &confirm,
+                session,
+                None,
+            ))
         }
         Cmd::Close {
             deal_id,
@@ -488,10 +574,7 @@ pub async fn exec(
             // netting working order (forceOpen false) that closes size at level.
             let market = &position.market;
             let epic = market.epic.clone().context("position has no epic")?;
-            let expiry = market
-                .expiry
-                .clone()
-                .context("position has no expiry")?;
+            let expiry = market.expiry.clone().context("position has no expiry")?;
             let bid = market.bid.context("market has no bid price")?;
             let offer = market.offer.context("market has no offer price")?;
             let name = market.instrument_name.clone();
@@ -539,6 +622,8 @@ pub async fn exec(
             size,
             level,
             order_type,
+            stop,
+            limit,
         } => {
             let epic = cache.resolve(&epic)?;
             let details = api
@@ -580,7 +665,7 @@ pub async fn exec(
                 }
             };
 
-            let body = json!({
+            let mut body = json!({
                 "currencyCode": currency,
                 "direction": direction,
                 "epic": epic,
@@ -592,16 +677,33 @@ pub async fn exec(
                 "timeInForce": "GOOD_TILL_CANCELLED",
                 "type": order_type,
             });
+            if let Some(stop) = stop {
+                body["stopLevel"] = json!(stop);
+            }
+            if let Some(limit) = limit {
+                body["limitLevel"] = json!(limit);
+            }
             let deal_ref = api
                 .create_working_order(body)
                 .await
                 .context("order rejected")?;
             let confirm = api.confirm(&deal_ref).await?;
-            let mut out = output::deal_block("Working order placed", &confirm, session, Some(&name));
+            let mut out =
+                output::deal_block("Working order placed", &confirm, session, Some(&name));
             let _ = writeln!(
                 out,
                 "  Type: {order_type} (good till cancelled) - cancel with `cancel <dealId>`"
             );
+            if stop.is_some() || limit.is_some() {
+                let mut parts = Vec::new();
+                if let Some(stop) = stop {
+                    parts.push(format!("stop {stop}"));
+                }
+                if let Some(limit) = limit {
+                    parts.push(format!("limit {limit}"));
+                }
+                let _ = writeln!(out, "  Attached: {}", parts.join(", "));
+            }
             if let Some(code) = instrument.chart_code.clone() {
                 cache.pin_from_trade(&code, &epic, Some(&expiry), Some(&name));
                 if let Err(err) = cache.save() {
@@ -670,5 +772,99 @@ fn level_value(level: Option<f64>) -> Value {
     match level {
         Some(v) => json!(v),
         None => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod sltp_parse_tests {
+    use super::*;
+
+    #[test]
+    fn open_with_sl_tp() {
+        let cmds = parse_input("open buy VOD 2 stop=110 limit=125").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Open {
+                direction: "BUY".into(),
+                epic: "VOD".into(),
+                size: 2.0,
+                level: None,
+                stop: Some(110.0),
+                limit: Some(125.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn open_with_level_and_sl_tp() {
+        let cmds = parse_input("open sell VOD 2 130 stop=135 limit=110").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Open {
+                direction: "SELL".into(),
+                epic: "VOD".into(),
+                size: 2.0,
+                level: Some(130.0),
+                stop: Some(135.0),
+                limit: Some(110.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn order_limit_with_sl_tp() {
+        let cmds = parse_input("order buy VOD 1 117 limit stop=110 limit=125").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Order {
+                direction: "BUY".into(),
+                epic: "VOD".into(),
+                size: 1.0,
+                level: 117.0,
+                order_type: Some("LIMIT".into()),
+                stop: Some(110.0),
+                limit: Some(125.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn order_sl_only_bare_type_still_works() {
+        let cmds = parse_input("order sell VOD 1 130 stop stop=135").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Order {
+                direction: "SELL".into(),
+                epic: "VOD".into(),
+                size: 1.0,
+                level: 130.0,
+                order_type: Some("STOP".into()),
+                stop: Some(135.0),
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn open_without_sl_tp_unchanged() {
+        let cmds = parse_input("open buy VOD 1 117").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Open {
+                direction: "BUY".into(),
+                epic: "VOD".into(),
+                size: 1.0,
+                level: Some(117.0),
+                stop: None,
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn chained_commands_still_split() {
+        let cmds = parse_input("open buy VOD 1 stop=110 limit=125 positions").unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[1], Cmd::Positions));
     }
 }

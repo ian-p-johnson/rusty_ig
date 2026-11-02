@@ -15,7 +15,7 @@ use std::path::PathBuf;
     name = "ig",
     version,
     about = "IG spread betting CLI: log in, print balance/positions/orders, log out",
-    after_help = "Commands: balance, positions, orders, search <term>,\n  open <buy|sell> <epic> <size> [level], order <buy|sell> <epic> <size> <level>,\n  cancel <dealId>, transactions [days], modify <dealId> stop=<n|off> limit=<n|off>,\n  close <dealId> [size] [level], help, quit"
+    after_help = "Commands: balance, positions, orders, search <term>,\n  open <buy|sell> <epic> <size> [level] [stop=<n>] [limit=<n>],\n  order <buy|sell> <epic> <size> <level> [limit|stop] [stop=<n>] [limit=<n>],\n  cancel <dealId>, transactions [days], modify <dealId> stop=<n|off> limit=<n|off>,\n  close <dealId> [size] [level], help, quit"
 )]
 struct Cli {
     /// Commands to run (space separated, e.g. `balance positions` or `search VOD*`)
