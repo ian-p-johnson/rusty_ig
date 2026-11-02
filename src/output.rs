@@ -1,11 +1,17 @@
 use crate::client::{
-    DealConfirm, DealingRules, PositionItem, RuleValue, SearchMarket, Session, WorkingOrderItem,
+    DealConfirm, DealingRules, MarketDetails, PositionItem, RuleValue, SearchMarket, Session,
+    WorkingOrderItem,
 };
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
+use std::collections::HashMap;
 use std::fmt::Write;
 
-pub fn balance_block(session: &Session) -> String {
+pub fn balance_block(
+    session: &Session,
+    positions: Option<&[PositionItem]>,
+    fx: Option<&HashMap<String, f64>>,
+) -> String {
     let mut out = String::new();
     let account = session.current_account();
     let balance = account.and_then(|a| a.balance.clone()).unwrap_or_default();
@@ -26,7 +32,100 @@ pub fn balance_block(session: &Session) -> String {
     kv(&mut out, "Balance", money(balance.balance, &symbol));
     kv(&mut out, "Margin used", money(balance.deposit, &symbol));
     kv(&mut out, "Open P&L", signed(balance.profit_loss, &symbol));
+    if let Some(positions) = positions {
+        let rates = fx.cloned().unwrap_or_default();
+        let (gross, excluded) = gross_exposure(positions, session.currency.as_deref(), &rates);
+        kv(&mut out, "Exposure", money(Some(gross), &symbol));
+        if fx.is_none() && !positions.is_empty() {
+            let _ = writeln!(out, "  (approximate - FX rates unavailable)");
+        }
+        if excluded > 0 {
+            let _ = writeln!(
+                out,
+                "  ({excluded} position{} in other currencies not included)",
+                if excluded == 1 { "" } else { "s" }
+            );
+        }
+    }
     out
+}
+
+/// Epic → FX divisor converting price-currency notional to account currency
+/// (native-currency `baseExchangeRate`, e.g. USD 1.34 per GBP; 1.0 when the
+/// price currency is the account currency). Missing details fall back to 1.0.
+pub fn fx_divisors(details: &[MarketDetails]) -> HashMap<String, f64> {
+    let mut map = HashMap::new();
+    for d in details {
+        let Some(inst) = d.instrument.as_ref() else {
+            continue;
+        };
+        let Some(epic) = inst.epic.as_deref() else {
+            continue;
+        };
+        let Some(list) = inst.currencies.as_ref().filter(|c| !c.is_empty()) else {
+            map.insert(epic.to_string(), 1.0);
+            continue;
+        };
+        // Native/price currency: first non-account entry, else the account's.
+        let native = list
+            .iter()
+            .find(|c| !c.is_default.unwrap_or(false))
+            .or_else(|| list.iter().find(|c| c.is_default.unwrap_or(false)));
+        let rate = native
+            .and_then(|c| c.base_exchange_rate)
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(1.0);
+        map.insert(epic.to_string(), rate);
+    }
+    map
+}
+
+/// Gross notional exposure: sum of |size × price × contractSize / fx_divisor|
+/// over positions whose settlement currency matches the account.
+/// Returns (total, excluded_count).
+fn gross_exposure(
+    positions: &[PositionItem],
+    account_currency: Option<&str>,
+    fx: &HashMap<String, f64>,
+) -> (f64, usize) {
+    let mut total = 0.0;
+    let mut excluded = 0;
+    for p in positions {
+        let Some(notional) = position_notional(p, account_currency, fx) else {
+            excluded += 1;
+            continue;
+        };
+        total += notional.abs();
+    }
+    (total, excluded)
+}
+
+/// Notional value of one position in account currency, or None if the
+/// position settlement currency can't be converted (differs from account).
+fn position_notional(
+    p: &PositionItem,
+    account_currency: Option<&str>,
+    fx: &HashMap<String, f64>,
+) -> Option<f64> {
+    let ccy = p.position.currency.as_deref()?;
+    if let Some(acc) = account_currency {
+        if !acc.eq_ignore_ascii_case(ccy) {
+            return None;
+        }
+    }
+    let size = p.position.size?;
+    let direction = p.position.direction.as_deref()?;
+    // Mark to market; fall back to open level if no quote.
+    let level = current_price(direction, p.market.bid, p.market.offer).or(p.position.level)?;
+    let contract_size = p.position.contract_size.unwrap_or(1.0);
+    let rate = p
+        .market
+        .epic
+        .as_deref()
+        .and_then(|e| fx.get(e))
+        .copied()
+        .unwrap_or(1.0);
+    Some(size * level * contract_size / rate)
 }
 
 fn kv(out: &mut String, label: &str, value: String) {
@@ -551,4 +650,174 @@ fn with_commas_str(s: &str) -> String {
         out.push_str(f);
     }
     out
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    fn pos(json: serde_json::Value) -> PositionItem {
+        serde_json::from_value(json).expect("valid position")
+    }
+
+    fn buy(size: f64, level: f64, bid: f64, ccy: &str) -> PositionItem {
+        pos(serde_json::json!({
+            "position": {
+                "dealId": "X",
+                "direction": "BUY",
+                "size": size,
+                "level": level,
+                "currency": ccy,
+                "contractSize": 1.0,
+            },
+            "market": { "bid": bid, "offer": bid + 1.0 }
+        }))
+    }
+
+    #[test]
+    fn gross_sums_absolute_notionals() {
+        // 1 @ 100 and 2 @ 50 → 100 + 100 = 200
+        let positions = vec![buy(1.0, 100.0, 100.0, "GBP"), buy(2.0, 50.0, 50.0, "GBP")];
+        let (total, excluded) = gross_exposure(&positions, Some("GBP"), &HashMap::new());
+        assert!((total - 200.0).abs() < 1e-9);
+        assert_eq!(excluded, 0);
+    }
+
+    #[test]
+    fn marks_to_market_with_bid() {
+        // open 100, bid 90 → notional uses 90
+        let positions = vec![buy(1.0, 100.0, 90.0, "GBP")];
+        let (total, _) = gross_exposure(&positions, Some("GBP"), &HashMap::new());
+        assert!((total - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn excludes_other_currencies() {
+        let positions = vec![buy(1.0, 100.0, 100.0, "GBP"), buy(1.0, 100.0, 100.0, "USD")];
+        let (total, excluded) = gross_exposure(&positions, Some("GBP"), &HashMap::new());
+        assert!((total - 100.0).abs() < 1e-9);
+        assert_eq!(excluded, 1);
+    }
+
+    #[test]
+    fn contract_size_multiplies() {
+        let positions = vec![pos(serde_json::json!({
+            "position": {
+                "direction": "BUY",
+                "size": 2.0,
+                "level": 100.0,
+                "currency": "GBP",
+                "contractSize": 3.0,
+            },
+            "market": { "bid": 100.0, "offer": 101.0 }
+        }))];
+        let (total, _) = gross_exposure(&positions, Some("GBP"), &HashMap::new());
+        assert!((total - 600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn falls_back_to_open_level_without_quote() {
+        let positions = vec![pos(serde_json::json!({
+            "position": {
+                "direction": "BUY",
+                "size": 1.0,
+                "level": 100.0,
+                "currency": "GBP",
+                "contractSize": 1.0,
+            },
+            "market": {}
+        }))];
+        let (total, _) = gross_exposure(&positions, Some("GBP"), &HashMap::new());
+        assert!((total - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fx_divides_price_currency_notional() {
+        let positions = vec![buy(1.0, 100.0, 100.0, "GBP")];
+        let mut fx = HashMap::new();
+        fx.insert("EPIC1".to_string(), 2.0);
+        // No epic on the position → default divisor 1.0 → unchanged
+        let (total, _) = gross_exposure(&positions, Some("GBP"), &fx);
+        assert!((total - 100.0).abs() < 1e-9);
+
+        let with_epic = pos(serde_json::json!({
+            "position": {
+                "dealId": "X",
+                "direction": "BUY",
+                "size": 1.0,
+                "level": 100.0,
+                "currency": "GBP",
+                "contractSize": 1.0,
+            },
+            "market": { "epic": "EPIC1", "bid": 100.0, "offer": 101.0 }
+        }));
+        let (total, _) = gross_exposure(&[with_epic], Some("GBP"), &fx);
+        assert!((total - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fx_divisors_pick_native_non_default_currency() {
+        let details: Vec<MarketDetails> = vec![serde_json::from_value(serde_json::json!({
+            "instrument": {
+                "epic": "UC.D.MSTR.DAILY.IP",
+                "currencies": [
+                    { "code": "USD", "baseExchangeRate": 1.34, "isDefault": false },
+                    { "code": "EUR", "baseExchangeRate": 1.2, "isDefault": false },
+                    { "code": "GBP", "baseExchangeRate": 1.0, "isDefault": true },
+                ],
+            },
+        }))
+        .unwrap()];
+        let fx = fx_divisors(&details);
+        assert!((fx["UC.D.MSTR.DAILY.IP"] - 1.34).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fx_divisors_default_currency_is_one() {
+        let details: Vec<MarketDetails> = vec![serde_json::from_value(serde_json::json!({
+            "instrument": {
+                "epic": "KA.D.VOD.DAILY.IP",
+                "currencies": [
+                    { "code": "GBP", "baseExchangeRate": 1.0, "isDefault": true },
+                ],
+            },
+        }))
+        .unwrap()];
+        let fx = fx_divisors(&details);
+        assert!((fx["KA.D.VOD.DAILY.IP"] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fx_divisors_default_first_non_default_still_wins() {
+        // ASA-NO style: account currency listed first, native second
+        let details: Vec<MarketDetails> = vec![serde_json::from_value(serde_json::json!({
+            "instrument": {
+                "epic": "EL.D.ASANO.DAILY.IP",
+                "currencies": [
+                    { "code": "GBP", "baseExchangeRate": 1.0, "isDefault": true },
+                    { "code": "NOK", "baseExchangeRate": 12.5, "isDefault": false },
+                ],
+            },
+        }))
+        .unwrap()];
+        let fx = fx_divisors(&details);
+        assert!((fx["EL.D.ASANO.DAILY.IP"] - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fx_divisors_missing_or_bad_rate_is_one() {
+        let details: Vec<MarketDetails> = vec![serde_json::from_value(serde_json::json!({
+            "instrument": { "epic": "A", "currencies": [] },
+        }))
+        .unwrap(), serde_json::from_value(serde_json::json!({
+            "instrument": {
+                "epic": "B",
+                "currencies": [{ "code": "USD", "baseExchangeRate": 0.0, "isDefault": false }],
+            },
+        }))
+        .unwrap()];
+        let fx = fx_divisors(&details);
+        assert_eq!(fx["A"], 1.0);
+        assert_eq!(fx["B"], 1.0);
+    }
 }

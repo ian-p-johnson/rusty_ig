@@ -361,7 +361,23 @@ pub async fn exec(
         Cmd::Balance => {
             let accounts = api.accounts().await.context("balance query failed")?;
             session.update_accounts(accounts);
-            Ok(output::balance_block(session))
+            // Exposure is calculated from positions; don't fail balance if this errors.
+            let positions = api.positions().await.ok();
+            // FX divisors from market details; balance still works without them.
+            let fx = match &positions {
+                Some(ps) if !ps.is_empty() => {
+                    let mut epics: Vec<String> =
+                        ps.iter().filter_map(|p| p.market.epic.clone()).collect();
+                    epics.sort();
+                    epics.dedup();
+                    api.markets_by_epics(&epics)
+                        .await
+                        .ok()
+                        .map(|details| output::fx_divisors(&details))
+                }
+                _ => Some(std::collections::HashMap::new()),
+            };
+            Ok(output::balance_block(session, positions.as_deref(), fx.as_ref()))
         }
         Cmd::Positions => {
             let positions = api.positions().await.context("positions query failed")?;

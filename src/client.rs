@@ -931,6 +931,20 @@ pub struct DetailsInstrument {
     pub chart_code: Option<String>,
     #[serde(default, deserialize_with = "flex_f64")]
     pub contract_size: Option<f64>,
+    /// Available dealing currencies; first entry is the market's native
+    /// (price) currency with baseExchangeRate = units per 1 account currency.
+    #[serde(default)]
+    pub currencies: Option<Vec<InstrumentCurrency>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct InstrumentCurrency {
+    pub code: Option<String>,
+    pub symbol: Option<String>,
+    pub base_exchange_rate: Option<f64>,
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
