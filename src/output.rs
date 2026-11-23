@@ -3,7 +3,7 @@ use crate::client::{
     WorkingOrderItem,
 };
 use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Cell, ContentArrangement, Table};
+use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -186,7 +186,13 @@ pub fn search_block(markets: &[SearchMarket], term: &str, width: Option<u16>) ->
     out
 }
 
-pub fn transactions_block(txs: &[crate::client::Transaction], from: &str, days: u32) -> String {
+pub fn transactions_block(
+    txs: &[crate::client::Transaction],
+    from: &str,
+    days: u32,
+    links: Option<&TradeLinks>,
+    width: Option<u16>,
+) -> String {
     use crate::client::Transaction;
     let mut out = String::new();
     if txs.is_empty() {
@@ -206,21 +212,43 @@ pub fn transactions_block(txs: &[crate::client::Transaction], from: &str, days: 
 
     if !deals.is_empty() {
         let _ = writeln!(out, "\nDeals {window} ({})", deals.len());
-        let mut table = new_table(vec!["Date", "Instrument", "Size", "Open", "Close", "P&L", "Reference"]);
+        let mut table = new_table(vec![
+            "Date",
+            "Instrument",
+            "Size",
+            "Open",
+            "Close",
+            "P&L",
+            "Deal ID",
+            "Deal ref",
+        ]);
+        // Keep the reference on one line when narrow; other columns wrap instead.
+        if let Some(col) = table.column_mut(7) {
+            col.set_constraint(ColumnConstraint::ContentWidth);
+        }
         let mut deals = deals;
         deals.sort_by(|a, b| {
-            let kb = b.date_utc.clone().or_else(|| b.date.clone()).unwrap_or_default();
             let ka = a.date_utc.clone().or_else(|| a.date.clone()).unwrap_or_default();
-            kb.cmp(&ka)
+            let kb = b.date_utc.clone().or_else(|| b.date.clone()).unwrap_or_default();
+            ka.cmp(&kb)
         });
         for t in deals {
-            table.add_row(deal_row(t));
+            table.add_row(deal_row(t, links));
+        }
+        if let Some(w) = width {
+            table.set_width(w);
         }
         let _ = writeln!(out, "{table}");
     }
 
     if !finances.is_empty() {
         let _ = writeln!(out, "\nFinances {window} ({})", finances.len());
+        let mut finances = finances;
+        finances.sort_by(|a, b| {
+            let ka = a.date_utc.clone().or_else(|| a.date.clone()).unwrap_or_default();
+            let kb = b.date_utc.clone().or_else(|| b.date.clone()).unwrap_or_default();
+            ka.cmp(&kb)
+        });
         let mut table = new_table(vec!["Date", "Type", "Description", "Amount", "Reference"]);
         for t in finances {
             table.add_row(vec![
@@ -232,9 +260,59 @@ pub fn transactions_block(txs: &[crate::client::Transaction], from: &str, days: 
                 Cell::new(t.reference.as_deref().unwrap_or("-")),
             ]);
         }
+        if let Some(w) = width {
+            table.set_width(w);
+        }
         let _ = writeln!(out, "{table}");
     }
     out
+}
+
+/// What the activity history says about each trade. Transactions only carry the
+/// closing deal's id, so the position it closed (its opening deal) and that
+/// position's reference both come from here.
+#[derive(Debug, Default)]
+pub struct TradeLinks {
+    /// closing deal id -> opening deal id of the position it closed
+    opening_of_close: HashMap<String, String>,
+    /// opening deal id -> reference the position was opened under
+    open_ref: HashMap<String, String>,
+}
+
+pub fn trade_links(activities: &[crate::client::ActivityItem]) -> TradeLinks {
+    let mut links = TradeLinks::default();
+    for a in activities {
+        let Some(deal_id) = a.deal_id.as_deref() else {
+            continue;
+        };
+        // A closing activity names the position it closed (affectedDealId).
+        if let Some(actions) = a.details.as_ref().and_then(|d| d.actions.as_ref()) {
+            for action in actions {
+                if let Some(opening) = action.affected_deal_id.as_deref() {
+                    if opening != deal_id {
+                        links
+                            .opening_of_close
+                            .entry(deal_id.to_string())
+                            .or_insert_with(|| opening.to_string());
+                    }
+                }
+            }
+        }
+        // The opening activity carries the position's own reference.
+        let opened = a.activity_type.as_deref() == Some("POSITION")
+            && a.description
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Position opened"));
+        if opened {
+            if let Some(reference) = a.details.as_ref().and_then(|d| d.deal_reference.as_deref()) {
+                links
+                    .open_ref
+                    .entry(deal_id.to_string())
+                    .or_insert_with(|| reference.to_string());
+            }
+        }
+    }
+    links
 }
 
 fn when(t: &crate::client::Transaction) -> String {
@@ -245,7 +323,11 @@ fn when(t: &crate::client::Transaction) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-fn deal_row(t: &crate::client::Transaction) -> Vec<Cell> {
+fn deal_row(
+    t: &crate::client::Transaction,
+    links: Option<&TradeLinks>,
+) -> Vec<Cell> {
+    let (deal_id, deal_ref) = trade_cells(t, links);
     let instrument = match (&t.instrument_name, &t.period) {
         (Some(n), Some(p)) if !p.is_empty() && !p.eq_ignore_ascii_case("DFB") => {
             format!("{n} ({p})")
@@ -264,8 +346,27 @@ fn deal_row(t: &crate::client::Transaction) -> Vec<Cell> {
             .set_alignment(comfy_table::CellAlignment::Right),
         Cell::new(t.profit_and_loss.clone().unwrap_or_else(|| "-".into()))
             .set_alignment(comfy_table::CellAlignment::Right),
-        Cell::new(t.reference.as_deref().unwrap_or("-")),
+        Cell::new(deal_id),
+        Cell::new(deal_ref),
     ]
+}
+
+/// Deal id and reference shown for a trade row: the position it closed (its
+/// opening deal), as the positions table shows them. Falls back to the closing
+/// deal's id when the activity history doesn't link it.
+fn trade_cells(t: &crate::client::Transaction, links: Option<&TradeLinks>) -> (String, String) {
+    let closing = t.reference.as_deref();
+    let opening = closing.and_then(|c| links?.opening_of_close.get(c));
+    match (opening, closing) {
+        (Some(open), _) => {
+            let reference = links
+                .and_then(|l| l.open_ref.get(open))
+                .map_or_else(|| "-".to_string(), |r| r.clone());
+            (open.clone(), reference)
+        }
+        (None, Some(close)) => (close.to_string(), "-".to_string()),
+        (None, None) => ("-".to_string(), "-".to_string()),
+    }
 }
 
 pub fn deal_block(
@@ -378,7 +479,13 @@ pub fn positions_block(
         "Stop",
         "Limit",
         "Deal ID",
+        "Deal ref",
     ]);
+    // Keep the reference on one line when the terminal is narrow; the other
+    // columns wrap instead. Column 9 is "Deal ref".
+    if let Some(col) = table.column_mut(9) {
+        col.set_constraint(ColumnConstraint::ContentWidth);
+    }
     for p in positions {
         let dir = p.position.direction.as_deref().unwrap_or("-");
         let current = current_price(dir, p.market.bid, p.market.offer);
@@ -414,6 +521,7 @@ pub fn positions_block(
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(p.position.deal_id.as_deref().unwrap_or("-")),
+            Cell::new(p.position.deal_reference.as_deref().unwrap_or("-")),
         ]);
     }
     if let Some(w) = width {
@@ -819,5 +927,146 @@ mod exposure_tests {
         let fx = fx_divisors(&details);
         assert_eq!(fx["A"], 1.0);
         assert_eq!(fx["B"], 1.0);
+    }
+}
+
+#[cfg(test)]
+mod positions_table_tests {
+    use super::*;
+
+    fn position_with_ref(deal_ref: Option<&str>) -> PositionItem {
+        serde_json::from_value(serde_json::json!({
+            "position": {
+                "dealId": "DIAAAATEST00001",
+                "dealReference": deal_ref,
+                "direction": "BUY",
+                "size": 1.0,
+                "level": 14574.0,
+                "currency": "GBP",
+                "contractSize": 1.0,
+            },
+            "market": {
+                "instrumentName": "Strategy Inc (24 Hours)",
+                "epic": "UC.D.MSTR.DAILY.IP",
+                "bid": 13124.0,
+                "offer": 13181.0,
+            },
+        }))
+        .expect("valid position")
+    }
+
+    #[test]
+    fn table_has_deal_reference_column() {
+        let out = positions_block(
+            &[position_with_ref(Some("TESTAC_17932182920003"))],
+            Some("GBP"),
+            None,
+        );
+        assert!(out.contains("Deal ref"), "{out}");
+        assert!(out.contains("TESTAC_17932182920003"), "{out}");
+    }
+
+    #[test]
+    fn deal_reference_stays_on_one_line_at_tui_widths() {
+        // The TUI passes terminal width - 4; the reference must not be split.
+        for width in [80u16, 100, 120] {
+            let out = positions_block(
+                &[position_with_ref(Some("TESTAC_17932182920003"))],
+                Some("GBP"),
+                Some(width),
+            );
+            assert!(out.contains("TESTAC_17932182920003"), "width {width}:\n{out}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod trade_links_tests {
+    use super::*;
+    use crate::client::{ActivityItem, Transaction};
+
+    fn close_tx(reference: &str) -> Transaction {
+        serde_json::from_value(serde_json::json!({
+            "transactionType": "DEAL",
+            "date": "2026-11-23",
+            "dateUtc": "2026-11-23T00:45:10",
+            "openDateUtc": "2026-11-22T23:58:00",
+            "instrumentName": "US Tech 100",
+            "period": "DFB",
+            "size": "+0.01",
+            "openLevel": "25776.90",
+            "closeLevel": "25778.20",
+            "profitAndLoss": "£0.01",
+            "reference": reference,
+        }))
+        .expect("valid transaction")
+    }
+
+    // The closing deal DIAAAATEST00002 closed the position opened by DIAAAATEST00003.
+    fn activities() -> Vec<ActivityItem> {
+        serde_json::from_value(serde_json::json!([
+            {
+                "dealId": "DIAAAATEST00002",
+                "type": "POSITION",
+                "description": "Position/s closed: TEST03",
+                "details": {
+                    "dealReference": "TESTREF_CLOSE_0002",
+                    "actions": [{"actionType": "POSITION_CLOSED", "affectedDealId": "DIAAAATEST00003"}]
+                }
+            },
+            {
+                "dealId": "DIAAAATEST00003",
+                "type": "POSITION",
+                "description": "Position opened: TEST03",
+                "details": {
+                    "dealReference": "TESTREF_OPEN_0003",
+                    "actions": [{"actionType": "POSITION_OPENED", "affectedDealId": "DIAAAATEST00003"}]
+                }
+            },
+        ]))
+        .expect("valid activities")
+    }
+
+    #[test]
+    fn closing_deal_links_to_its_position_and_that_positions_reference() {
+        let links = trade_links(&activities());
+        assert_eq!(links.opening_of_close["DIAAAATEST00002"], "DIAAAATEST00003");
+        assert_eq!(links.open_ref["DIAAAATEST00003"], "TESTREF_OPEN_0003");
+        assert!(!links.opening_of_close.contains_key("DIAAAATEST00003"));
+    }
+
+    #[test]
+    fn row_shows_the_position_id_and_reference_not_the_closing_ones() {
+        let links = trade_links(&activities());
+        let out = transactions_block(&[close_tx("DIAAAATEST00002")], "2026-11-22", 1, Some(&links), None);
+        assert!(out.contains("DIAAAATEST00003"), "{out}");
+        assert!(out.contains("TESTREF_OPEN_0003"), "{out}");
+        assert!(!out.contains("DIAAAATEST00002"), "{out}");
+        assert!(!out.contains("TESTREF_CLOSE_0002"), "{out}");
+    }
+
+    #[test]
+    fn unlinked_trade_falls_back_to_closing_id_and_dash() {
+        let out = transactions_block(&[close_tx("DIAAAATEST00002")], "2026-11-22", 1, None, None);
+        assert!(out.contains("DIAAAATEST00002"), "{out}");
+        assert!(!out.contains("TESTREF_OPEN"), "{out}");
+    }
+
+    #[test]
+    fn reference_stays_whole_at_tui_widths() {
+        let links = trade_links(&activities());
+        for width in [80u16, 100, 120] {
+            let out = transactions_block(&[close_tx("DIAAAATEST00002")], "2026-11-22", 1, Some(&links), Some(width));
+            assert!(out.contains("TESTREF_OPEN_0003"), "width {width}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn only_position_openings_give_a_position_reference() {
+        let acts: Vec<ActivityItem> = serde_json::from_value(serde_json::json!([
+            {"dealId": "DIAAAATEST00003", "type": "WORKING_ORDER", "description": "Limit order opened: TESTWO01", "details": {"dealReference": "TESTREF_WORKING_0004"}},
+        ]))
+        .expect("valid activities");
+        assert!(trade_links(&acts).open_ref.is_empty());
     }
 }

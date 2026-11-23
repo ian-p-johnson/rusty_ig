@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::fmt::Write;
 
 pub const HELP: &str = "\nCommands\n  balance                                     Refresh and show account balance\n  positions                                   List open positions\n  orders                                       List working orders\n  search <term>                                Find instruments; shows Code column\n  open <buy|sell> <epic|name> <size> [level] [stop=<n>] [limit=<n>]\n                                               Open now (level = fill cap); stop/limit attach SL/TP\n  order <buy|sell> <epic|name> <size> <level> [limit|stop] [stop=<n>] [limit=<n>]\n                                               Resting entry; limit/stop vs market; attach SL/TP\n  cancel <dealId>                              Cancel a working order\n  modify <dealId> stop=<n|off> limit=<n|off>   Set or remove stop/limit on an open position\n  close <dealId> [size] [level]                Close now; with level = resting exit\n  pin <code> <epic|off>                        Pin/unpin a short name\n
-  transactions [days]                          Ledger; default last 24h, N days to go back\n  help                                         Show this help\n  clear                                        Clear this output\n  quit                                         Log out and exit\n\nShort names: search shows the Code column; trading an epic pins its code\nautomatically (or pin explicitly). Codes persist across restarts.\n\nExamples\n  search VOD*\n  order buy VOD 1 117\n  order buy VOD 1 117 limit stop=110 limit=125\n  open buy UC.D.VOD.DAILY.IP 2 stop=110 limit=125\n  pin VOD KA.D.VOD.DAILY.IP\n  close DIAAAAYRNGEVNAJ";
+  transactions [days]                          Ledger; default last 24h, N days to go back\n  help                                         Show this help\n  clear                                        Clear this output\n  quit                                         Log out and exit\n\nShort forms: ba balance, po positions, o orders, se search, op open,\n  or order, mo modify, cl close, ca cancel, tr transactions, qu quit\n\nShort names: search shows the Code column; trading an epic pins its code\nautomatically (or pin explicitly). Codes persist across restarts.\n\nExamples\n  search VOD*\n  order buy VOD 1 117\n  order buy VOD 1 117 limit stop=110 limit=125\n  open buy UC.D.VOD.DAILY.IP 2 stop=110 limit=125\n  pin VOD KA.D.VOD.DAILY.IP\n  close DIAAAATEST00001";
 
 const SIMPLE: [&str; 11] = [
     "balance",
@@ -21,6 +21,24 @@ const SIMPLE: [&str; 11] = [
     "quit",
     "exit",
 ];
+
+/// Map short forms to the canonical command name (identity for full names).
+fn canonical(word: &str) -> &str {
+    match word {
+        "ba" => "balance",
+        "po" => "positions",
+        "o" => "orders",
+        "se" => "search",
+        "op" => "open",
+        "or" => "order",
+        "mo" => "modify",
+        "cl" => "close",
+        "ca" => "cancel",
+        "tr" => "transactions",
+        "qu" => "quit",
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
@@ -77,7 +95,7 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
     let mut cmds = Vec::new();
     let mut i = 0;
     while i < words.len() {
-        match words[i] {
+        match canonical(words[i]) {
             "balance" => {
                 cmds.push(Cmd::Balance);
                 i += 1;
@@ -106,8 +124,8 @@ pub fn parse_input(input: &str) -> Result<Vec<Cmd>, String> {
                 i += 1;
                 let mut parts: Vec<&str> = Vec::new();
                 while i < words.len()
-                    && !SIMPLE.contains(&words[i])
-                    && !matches!(words[i], "search" | "open" | "modify" | "close")
+                    && !SIMPLE.contains(&canonical(words[i]))
+                    && !matches!(canonical(words[i]), "search" | "open" | "modify" | "close")
                 {
                     parts.push(words[i]);
                     i += 1;
@@ -377,7 +395,11 @@ pub async fn exec(
                 }
                 _ => Some(std::collections::HashMap::new()),
             };
-            Ok(output::balance_block(session, positions.as_deref(), fx.as_ref()))
+            Ok(output::balance_block(
+                session,
+                positions.as_deref(),
+                fx.as_ref(),
+            ))
         }
         Cmd::Positions => {
             let positions = api.positions().await.context("positions query failed")?;
@@ -749,7 +771,39 @@ pub async fn exec(
                 .transactions(&from.to_string(), &to.to_string())
                 .await
                 .context("transactions query failed")?;
-            Ok(output::transactions_block(&txs, &from.to_string(), days))
+            // Transactions only carry the closing deal's id. The position it closed
+            // and that position's reference come from the activity history, which has
+            // to reach back to when the earliest of these trades was opened.
+            let has_deals = txs
+                .iter()
+                .any(|t| t.transaction_type.as_deref() == Some("DEAL"));
+            let (links, note) = if has_deals {
+                let earliest_open = txs
+                    .iter()
+                    .filter(|t| t.transaction_type.as_deref() == Some("DEAL"))
+                    .filter_map(|t| t.open_date_utc.as_deref()?.get(..10))
+                    .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .min()
+                    .map(|d| d - chrono::Duration::days(1));
+                let act_from = earliest_open.map_or(from, |e| e.min(from));
+                match api.activities(&act_from.to_string(), &to.to_string()).await {
+                    Ok(acts) => (Some(output::trade_links(&acts)), None),
+                    Err(err) => (None, Some(format!("  Deal ref unavailable: {err:#}\n"))),
+                }
+            } else {
+                (None, None)
+            };
+            let mut out = output::transactions_block(
+                &txs,
+                &from.to_string(),
+                days,
+                links.as_ref(),
+                width,
+            );
+            if let Some(note) = note {
+                out.push_str(&note);
+            }
+            Ok(out)
         }
         Cmd::Pin { code, epic } => {
             if matches!(epic.as_str(), "off" | "none" | "remove" | "clear" | "-") {
@@ -882,5 +936,120 @@ mod sltp_parse_tests {
         let cmds = parse_input("open buy VOD 1 stop=110 limit=125 positions").unwrap();
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[1], Cmd::Positions));
+    }
+}
+
+#[cfg(test)]
+mod short_alias_tests {
+    use super::*;
+
+    #[test]
+    fn simple_no_arg_aliases() {
+        assert_eq!(parse_input("ba").unwrap(), vec![Cmd::Balance]);
+        assert_eq!(parse_input("po").unwrap(), vec![Cmd::Positions]);
+        assert_eq!(parse_input("o").unwrap(), vec![Cmd::Orders]);
+        assert_eq!(parse_input("qu").unwrap(), vec![Cmd::Quit]);
+    }
+
+    #[test]
+    fn aliases_with_args() {
+        assert_eq!(
+            parse_input("op buy VOD 1 stop=110").unwrap(),
+            vec![Cmd::Open {
+                direction: "BUY".into(),
+                epic: "VOD".into(),
+                size: 1.0,
+                level: None,
+                stop: Some(110.0),
+                limit: None,
+            }]
+        );
+        assert_eq!(
+            parse_input("mo X123 limit=off").unwrap(),
+            vec![Cmd::Modify {
+                deal_id: "X123".into(),
+                stop: None,
+                limit: Some(None),
+            }]
+        );
+        assert_eq!(
+            parse_input("ca X123").unwrap(),
+            vec![Cmd::Cancel {
+                deal_id: "X123".into()
+            }]
+        );
+        assert_eq!(
+            parse_input("cl X123 0.5").unwrap(),
+            vec![Cmd::Close {
+                deal_id: "X123".into(),
+                size: Some(0.5),
+                level: None,
+            }]
+        );
+        assert_eq!(
+            parse_input("tr 7").unwrap(),
+            vec![Cmd::Transactions { days: 7 }]
+        );
+        assert_eq!(
+            parse_input("se VOD*").unwrap(),
+            vec![Cmd::Search {
+                term: "VOD*".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn order_alias_parses_order() {
+        let cmds = parse_input("or buy VOD 1 117 limit stop=110").unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::Order {
+                direction: "BUY".into(),
+                epic: "VOD".into(),
+                size: 1.0,
+                level: 117.0,
+                order_type: Some("LIMIT".into()),
+                stop: Some(110.0),
+                limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn full_names_still_work() {
+        assert_eq!(parse_input("balance").unwrap(), vec![Cmd::Balance]);
+        assert_eq!(parse_input("positions").unwrap(), vec![Cmd::Positions]);
+    }
+
+    #[test]
+    fn aliases_split_chained_commands() {
+        let cmds = parse_input("ba po o").unwrap();
+        assert_eq!(cmds, vec![Cmd::Balance, Cmd::Positions, Cmd::Orders]);
+    }
+
+    #[test]
+    fn search_stops_at_alias() {
+        // term stops when next word canonicalizes to a command
+        let cmds = parse_input("se VOD* cl X123").unwrap();
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::Search {
+                    term: "VOD*".into()
+                },
+                Cmd::Close {
+                    deal_id: "X123".into(),
+                    size: None,
+                    level: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_words_are_not_swallowed() {
+        assert!(parse_input("frobnicate").is_err());
+        // "o" is orders, not an open-ended token
+        assert_eq!(parse_input("o").unwrap(), vec![Cmd::Orders]);
     }
 }

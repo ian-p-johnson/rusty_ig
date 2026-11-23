@@ -288,6 +288,52 @@ impl IgClient {
         Ok(all)
     }
 
+    /// Account activity history, detailed (v3). Unlike transactions, these carry
+    /// `details.dealReference`. Pages of 500 until a short page; fails past 20 pages.
+    pub async fn activities(&self, from: &str, to: &str) -> Result<Vec<ActivityItem>> {
+        const PAGE_SIZE: usize = 500;
+        const MAX_PAGES: u32 = 20;
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_str = page.to_string();
+            let size_str = PAGE_SIZE.to_string();
+            let resp = self
+                .send_q(
+                    reqwest::Method::GET,
+                    "/history/activity",
+                    "3",
+                    &[
+                        ("from", from),
+                        ("to", to),
+                        ("detailed", "true"),
+                        ("pageSize", &size_str),
+                        ("pageNumber", &page_str),
+                    ],
+                    None,
+                )
+                .await?;
+            let text = resp.text().await.context("cannot read activity response")?;
+            let parsed: ActivitiesResponse = serde_json::from_str(&text).with_context(|| {
+                format!("cannot parse activity response: {}", truncate(&text, 400))
+            })?;
+            let got = parsed.activities.len();
+            all.extend(parsed.activities);
+            if got < PAGE_SIZE {
+                break;
+            }
+            if page >= MAX_PAGES {
+                bail!(
+                    "activity history is longer than {} items",
+                    MAX_PAGES as usize * PAGE_SIZE
+                );
+            }
+            page += 1;
+            tokio::time::sleep(CALL_PAUSE).await;
+        }
+        Ok(all)
+    }
+
     pub async fn positions(&self) -> Result<Vec<PositionItem>> {
         Ok(self
             .get_json::<PositionsResponse>("/positions", "2")
@@ -617,6 +663,7 @@ pub struct PositionItem {
 #[allow(dead_code)]
 pub struct Position {
     pub deal_id: Option<String>,
+    pub deal_reference: Option<String>,
     pub direction: Option<String>,
     pub size: Option<f64>,
     pub level: Option<f64>,
@@ -760,6 +807,35 @@ pub struct PageData {
     pub page_number: Option<u32>,
     #[serde(default)]
     pub total_pages: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActivitiesResponse {
+    #[serde(default)]
+    pub activities: Vec<ActivityItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityItem {
+    pub deal_id: Option<String>,
+    #[serde(rename = "type")]
+    pub activity_type: Option<String>,
+    pub description: Option<String>,
+    pub details: Option<ActivityDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityDetails {
+    pub deal_reference: Option<String>,
+    pub actions: Option<Vec<ActivityAction>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityAction {
+    pub affected_deal_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
